@@ -31,7 +31,8 @@ class SlideSpeakGenerator:
         language: str = "ENGLISH",
         fetch_images: bool = True,
         verbosity: str = "standard",
-        tone: str = "educational"
+        tone: str = "educational",
+        template: str = "default"
     ):
         """
         Generates and retrieves a SlideSpeak presentation by polling the task status.
@@ -44,6 +45,7 @@ class SlideSpeakGenerator:
             fetch_images (bool, optional): Whether to include stock images. Defaults to True.
             verbosity (str, optional): The desired text verbosity. Defaults to "standard".
             tone (str, optional): The tone of the presentation. Defaults to "educational".
+            template (str): The name of the template or the ID of a custom template. Defaults to "default".
 
         Returns:
             dict: The final JSON response from the SlideSpeak API.
@@ -59,7 +61,8 @@ class SlideSpeakGenerator:
             "language": language,
             "fetch_images": fetch_images,
             "verbosity": verbosity,
-            "tone": tone
+            "tone": tone,
+            "template": template
         }
 
         try:
@@ -109,6 +112,7 @@ def main():
     fetch_images_input = input("Fetch Images (true/false): ").lower()
     presentation_verbosity = input("Verbosity (concise/standard/text-heavy): ").lower()
     presentation_tone = "educational"
+    presentation_template = input("Template (leave blank for default): ") or "default"
 
     fetch_images_bool = fetch_images_input == "true"
 
@@ -122,7 +126,8 @@ def main():
         language=presentation_language,
         fetch_images=fetch_images_bool,
         verbosity=presentation_verbosity,
-        tone=presentation_tone
+        tone=presentation_tone,
+        template=presentation_template
     )
 
     print("\n--- Final API Response ---")

@@ -42,25 +42,32 @@ def get_query_from_user_input():
     grade_level = input("Enter the grade level (e.g., 10): ")
     subject = input("Enter the subject (e.g., History): ")
     content_type = input("Enter the preferred content type (e.g., articles, videos): ")
-    language = input("Enter the language (e.g., English): ")
+    language = input("Enter the language (e.g., English or Arabic): ")
     comprehension = input("Enter the comprehension level (e.g., beginner, intermediate): ")
-    num_results = input("Enter the number of results (e.g., 5): ")
-    
-    # Prompt for max_results and handle potential errors
-    try:
-        max_results = int(num_results)
-    except ValueError:
-        print("Invalid input for maximum results. Using a default value of 10.")
-        max_results = 10    
 
-    # Building the query from user inputs
-    query = (
-        f"Show me up to {max_results} {content_type} about '{topic}' "
-        f"for a grade {grade_level} {subject} class. "
-        f"The content should be in {language} with a {comprehension} comprehension level. "
-        "Include links in the response with detailed lengthy response content." 
-        "Include the source of the content in the response."
-    )
+    # --- MODIFICATION START ---
+    # Dynamically build the query based on the selected language.
+    
+    query = ""
+    # Check if the user selected Arabic, and if so, create the prompt in Arabic.
+    if language.lower().strip() == 'arabic':
+        query = (
+            f"اعرض لي {content_type} حول '{topic}' بالتفصيل "
+            f"لصف {grade_level} في مادة {subject}. "
+            f"يجب أن يكون المحتوى باللغة العربية مع مستوى فهم {comprehension}. "
+            f"قم بتضمين روابط في الاستجابة مع محتوى مفصل ومطول. "
+            f"قم بتضمين مصدر المحتوى في الاستجابة."
+        )
+    # Default to English for any other input.
+    else:
+        query = (
+            f"Show me {content_type} about '{topic}' in detail "
+            f"for a grade {grade_level} {subject} class. "
+            f"The content should be in {language} with a {comprehension} comprehension level. "
+            "Include links in the response with detailed lengthy response content. "
+            "Include the source of the content in the response." 
+        )
+    # --- MODIFICATION END ---
     
     return query
 
@@ -82,6 +89,7 @@ def main():
         try:
             # Stream the response from the model using the generated query
             full_response = ""
+            # The model will stream the response in the language requested in the query
             for chunk in chat.stream(meaningful_query):
                 print(chunk.content, end="", flush=True)
                 full_response += chunk.content

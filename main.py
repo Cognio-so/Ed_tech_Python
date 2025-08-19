@@ -4,7 +4,7 @@ import logging
 from typing import List, Dict, Any, Optional
 
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -36,6 +36,13 @@ from teaching_content_generation import run_generation_pipeline_async as generat
 from media_toolkit.slides_generation import SlideSpeakGenerator
 from media_toolkit.image_generation_model import ImageGenerator
 from media_toolkit.comics_generation import create_comical_story_prompt, generate_comic_image
+
+# Voice functionality imports
+from AI_voice_functionality import (
+    transcribe_audio, 
+    get_comprehensive_answer_stream, 
+    AI_STUDY_BUDDY_PROMPT
+)
 
 # Import the Perplexity chat instance from your module
 try:
@@ -98,49 +105,362 @@ try:
 
     # Initialize Tutor Sessions Dictionary
     tutor_sessions: Dict[str, AsyncRAGTutor] = {}
-    logger.info("✅ AI Tutor session manager is ready.")
 
-    # Initialize Assessment Generation Chain
+    # Initialize other components
+    slide_generator = SlideSpeakGenerator()
+    image_generator = ImageGenerator()
+    
+    # Initialize assessment chain
     google_api_key = os.getenv("GOOGLE_API_KEY")
-    logger.info(f"GOOGLE_API_KEY: {google_api_key}")
-    if not google_api_key:
-        logger.warning("GOOGLE_API_KEY not found. Assessment endpoint may fail.")
-        assessment_chain = None
-    else:
+    if google_api_key:
         assessment_chain = create_question_generation_chain(google_api_key)
-        logger.info("✅ Assessment generation chain created successfully.")
-    
-    # Check SlideSpeak API Key
-    slidespeak_api_key = os.getenv("SLIDESPEAK_API_KEY")
-    if not slidespeak_api_key:
-        logger.warning("SLIDESPEAK_API_KEY not found. Presentation endpoint may fail.")
+        logger.info("✅ Assessment chain initialized successfully.")
     else:
-        logger.info("✅ SlideSpeak API key is configured.")
+        assessment_chain = None
+        logger.warning("⚠️ Google API key not found. Assessment functionality will be limited.")
     
-    # Note: Teaching content generation is initialized on-the-fly, so we confirm its readiness here.
-    logger.info("✅ Teaching content generation module is ready.")
-    logger.info("All components initialized. The API is ready to accept requests.")
-
+    logger.info("✅ All global components initialized successfully.")
 except Exception as e:
-    logger.error(f"❌ CRITICAL ERROR during initialization: {e}", exc_info=True)
-    # Depending on the desired behavior, you might want to exit the application
-    # raise SystemExit(f"Failed to initialize critical components: {e}")
+    logger.error(f"❌ Error initializing global components: {e}", exc_info=True)
+    raise
 
-# ==============================================================================
-# HEALTH CHECK ENDPOINT
-# ==============================================================================
-
+# ==============================
+# 1. HEALTH CHECK ENDPOINT
+# ==============================
 @app.get("/health")
 async def health_check():
     """Health check endpoint to verify the API is running."""
     return {
         "status": "healthy",
         "message": "AI Education Platform API is running",
-        "version": "1.0.0"
+        "timestamp": "2024-01-01T00:00:00Z"
     }
 
+# ==============================
+# 2. VOICE FUNCTIONALITY ENDPOINTS
+# ==============================
+
+class VoiceTranscriptionSchema(BaseModel):
+    """Schema for voice transcription requests."""
+    pass
+
+class VoiceChatSchema(BaseModel):
+    """Schema for voice chat requests."""
+    text: str = Field(..., description="User's text input")
+    web_search_enabled: bool = Field(False, description="Whether to enable web search")
+
+@app.post("/voice_transcription_endpoint")
+async def voice_transcription_endpoint(audio_file: UploadFile = File(...)):
+    """Transcribe audio to text using OpenAI's Whisper model."""
+    try:
+        logger.info(f"Processing voice transcription for file: {audio_file.filename}")
+        
+        temp_audio_path = await storage_manager.save_file_async(audio_file)
+        import io
+        audio_bytes = await storage_manager.get_file_content_bytes_async(temp_audio_path)
+        audio_io = io.BytesIO(audio_bytes)
+        audio_io.name = audio_file.filename
+        
+        transcription = await run_in_threadpool(transcribe_audio, audio_io)
+        
+        try:
+            os.remove(temp_audio_path)
+        except:
+            pass
+        
+        if transcription:
+            return {
+                "success": True,
+                "transcription": transcription,
+                "message": "Audio transcribed successfully"
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Failed to transcribe audio")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in voice transcription endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add this new endpoint for real-time voice interaction
+@app.post("/voice_realtime_endpoint")
+async def voice_realtime_endpoint():
+    """
+    Real-time voice interaction endpoint that uses the actual voice functionality.
+    This streams audio in real-time like ChatGPT.
+    """
+    async def event_stream():
+        import json
+        import asyncio
+        from AI_voice_functionality import (
+            transcribe_audio, 
+            get_comprehensive_answer_stream,
+            text_to_speech,
+            AI_STUDY_BUDDY_PROMPT
+        )
+        
+        async def send(obj: dict):
+            yield f"data: {json.dumps(obj)}\n\n"
+
+        try:
+            # This simulates the real-time voice interaction
+            # In a real implementation, you'd stream audio chunks here
+            async for part in send({"type": "voice_ready", "message": "Voice system ready"}):
+                yield part
+
+        except Exception as e:
+            logger.error(f"Error in real-time voice stream: {e}", exc_info=True)
+            async for part in send({"type": "error", "message": str(e)}):
+                yield part
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "text/event-stream",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(event_stream(), headers=headers, media_type="text/event-stream")
+
+# Update the voice chat endpoint to use real-time processing
+@app.post("/voice_chat_endpoint")
+async def voice_chat_endpoint(schema: VoiceChatSchema):
+    """
+    Real-time voice chat using the actual voice functionality.
+    """
+    async def event_stream():
+        import json
+        from AI_voice_functionality import get_comprehensive_answer_stream
+        
+        async def send(obj: dict):
+            yield f"data: {json.dumps(obj)}\n\n"
+
+        try:
+            full_response = ""
+            
+            # Use the real voice functionality for streaming responses
+            for chunk in get_comprehensive_answer_stream(schema.text):
+                if not chunk:
+                    continue
+                full_response += chunk
+                # Stream text in real-time
+                async for part in send({"type": "text_chunk", "content": chunk}):
+                    yield part
+
+            async for part in send({"type": "done"}):
+                yield part
+
+        except Exception as e:
+            logger.error(f"Error in real-time voice chat: {e}", exc_info=True)
+            async for part in send({"type": "error", "message": str(e)}):
+                yield part
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "text/event-stream",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(event_stream(), headers=headers, media_type="text/event-stream")
+
+# Add WebSocket support for real-time voice with proper user control
+from fastapi import WebSocket, WebSocketDisconnect
+import asyncio
+import numpy as np
+import io
+import wave
+import base64
+import tempfile
+import os
+
+@app.websocket("/ws/voice")
+async def websocket_voice_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    # Initialize voice processing components
+    from AI_voice_functionality import (
+        transcribe_audio, 
+        get_comprehensive_answer_stream,
+        text_to_speech,
+        AI_STUDY_BUDDY_PROMPT
+    )
+    
+    # Audio buffer with proper user control
+    audio_buffer = []
+    is_processing = False
+    is_listening = False
+    user_activated = False  # Only process when user explicitly activates
+    
+    try:
+        while True:
+            # Receive real-time audio chunks
+            data = await websocket.receive_json()
+            
+            if data["type"] == "start_listening":
+                is_listening = True
+                user_activated = True  # User has activated voice mode
+                audio_buffer = []  # Clear buffer
+                await websocket.send_json({
+                    "type": "listening_started",
+                    "message": "Ready to listen"
+                })
+                
+            elif data["type"] == "audio_chunk":
+                if not is_listening or is_processing or not user_activated:
+                    continue
+                    
+                # Convert audio data to proper format
+                audio_chunk = np.array(data["data"], dtype=np.float32)
+                
+                # Only buffer audio when user is speaking AND voice is activated
+                if data.get("is_speaking", False):
+                    audio_buffer.extend(audio_chunk)
+                
+            elif data["type"] == "process_audio":
+                # Only process if user has activated voice mode
+                if not user_activated or is_processing or len(audio_buffer) == 0:
+                    continue
+                    
+                is_processing = True
+                is_listening = False
+                
+                # Send processing status
+                await websocket.send_json({
+                    "type": "processing",
+                    "message": "Processing speech..."
+                })
+                
+                try:
+                    # Convert buffer to audio file format for OpenAI Whisper
+                    audio_data = np.array(audio_buffer, dtype=np.float32)
+                    audio_buffer = []  # Clear buffer
+                    
+                    # Only process if we have enough audio (at least 1 second)
+                    if len(audio_data) < 16000:  # Less than 1 second
+                        logger.info("Audio too short, ignoring")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Audio too short to process"
+                        })
+                        continue
+                    
+                    # Create a proper WAV file that OpenAI can recognize
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+                        # Create WAV file with proper headers
+                        with wave.open(temp_file.name, 'wb') as wf:
+                            wf.setnchannels(1)  # Mono
+                            wf.setsampwidth(2)  # 16-bit
+                            wf.setframerate(16000)  # 16kHz
+                            # Convert float32 to int16 properly
+                            audio_int16 = (audio_data * 32767).astype(np.int16)
+                            wf.writeframes(audio_int16.tobytes())
+                    
+                    logger.info(f"Processing audio: {len(audio_data)} samples, saved to {temp_file.name}")
+                    
+                    # Open the file for transcription
+                    with open(temp_file.name, 'rb') as audio_file:
+                        # Transcribe the audio using OpenAI Whisper
+                        transcription = await asyncio.get_event_loop().run_in_executor(
+                            None, transcribe_audio, audio_file
+                        )
+                    
+                    # Clean up temporary file
+                    try:
+                        os.unlink(temp_file.name)
+                    except:
+                        pass
+                    
+                    if transcription and transcription.strip():
+                        logger.info(f"Transcription: {transcription}")
+                        
+                        # Send transcription back
+                        await websocket.send_json({
+                            "type": "transcription",
+                            "text": transcription
+                        })
+                        
+                        # Generate AI response
+                        response_stream = get_comprehensive_answer_stream(transcription)
+                        full_response = ""
+                        
+                        for chunk in response_stream:
+                            if chunk:
+                                full_response += chunk
+                                await websocket.send_json({
+                                    "type": "response_chunk",
+                                    "content": chunk
+                                })
+                        
+                        # Generate TTS audio using OpenAI TTS
+                        try:
+                            logger.info(f"Generating TTS for response: {full_response[:100]}...")
+                            audio_data = await asyncio.get_event_loop().run_in_executor(
+                                None, text_to_speech, full_response
+                            )
+                            
+                            if audio_data:
+                                logger.info(f"TTS generated successfully, audio size: {len(audio_data)} bytes")
+                                # Encode audio as base64 for sending over WebSocket
+                                audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+                                audio_url = f"data:audio/mp3;base64,{audio_b64}"
+                                
+                                # Send completion with audio
+                                await websocket.send_json({
+                                    "type": "response_complete",
+                                    "full_response": full_response,
+                                    "audio_url": audio_url,
+                                    "audio_format": "mp3"
+                                })
+                                logger.info("Sent response with TTS audio")
+                            else:
+                                logger.warning("TTS generation returned None")
+                                # Send completion without audio
+                                await websocket.send_json({
+                                    "type": "response_complete",
+                                    "full_response": full_response
+                                })
+                                
+                        except Exception as e:
+                            logger.error(f"TTS error: {e}", exc_info=True)
+                            # Send completion without audio
+                            await websocket.send_json({
+                                "type": "response_complete",
+                                "full_response": full_response
+                            })
+                    else:
+                        logger.warning("No transcription generated")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Could not transcribe audio"
+                        })
+                        
+                except Exception as e:
+                    logger.error(f"Voice processing error: {e}", exc_info=True)
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Processing error: {str(e)}"
+                    })
+                
+                finally:
+                    is_processing = False
+                    is_listening = True
+                    user_activated = False  # Reset user activation
+                        
+            elif data["type"] == "stop":
+                user_activated = False
+                break
+                
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}", exc_info=True)
+        await websocket.send_json({
+            "type": "error",
+            "message": f"WebSocket error: {str(e)}"
+        })
+
 # ==============================================================================
-# 1. CHATBOT ENDPOINT
+# 3. CHATBOT ENDPOINT (JSON-only, SSE text streaming)
 # ==============================================================================
 
 class ChatbotRequest(BaseModel):
@@ -150,20 +470,15 @@ class ChatbotRequest(BaseModel):
     web_search_enabled: bool = Field(False, description="Enable or disable web search functionality for the tutor.")
 
 @app.post("/chatbot_endpoint")
-async def chatbot_endpoint(
-    files: Optional[List[UploadFile]] = File(None, description="Optional list of files (documents, images) to upload to the knowledge base."),
-    request: ChatbotRequest = Body(...)
-):
+async def chatbot_endpoint(request: ChatbotRequest):
     """
-    Handles interactions with the AI tutor. It supports file uploads for
-    building a knowledge base and conversational queries with streaming responses.
-    A `session_id` must be provided to maintain conversation state.
+    Handles interactions with the AI tutor with JSON-only requests.
+    Streaming text responses, no audio files.
     """
     session_id = request.session_id
     
     # Get or create a tutor instance for the session
     if session_id not in tutor_sessions:
-        # This log confirms a new user/session is starting
         logger.info(f"Creating new AI Tutor session: {session_id}")
         tutor_config = RAGTutorConfig.from_env()
         tutor_sessions[session_id] = AsyncRAGTutor(storage_manager=storage_manager, config=tutor_config)
@@ -173,46 +488,45 @@ async def chatbot_endpoint(
     # Dynamically update web search status for the tutor
     tutor.update_web_search_status(request.web_search_enabled)
 
-    # --- File Ingestion Logic ---
-    if files:
-        storage_keys = []
-        filenames = []
-        for file in files:
-            if not file.filename:
-                continue
-            storage_key = await storage_manager.save_file_async(file)
-            storage_keys.append(storage_key)
-            filenames.append(file.filename)
-        
-        if storage_keys:
-            logger.info(f"Ingesting {len(storage_keys)} files for session {session_id}...")
-            # Initialize the vectorstore and ingest documents
-            await tutor.ingest_async(storage_keys)
-            
-            # Since this is a file upload, we return a confirmation message, not a stream.
-            return {
-                "message": "Files uploaded and processed successfully.",
-                "uploaded_files": filenames
-            }
-
     # --- Query Processing Logic ---
     if not request.query:
-        raise HTTPException(status_code=400, detail="A 'query' is required when no files are uploaded.")
+        raise HTTPException(status_code=400, detail="A 'query' is required.")
 
-    # Generate the response as a stream
     is_kb_ready = tutor.ensemble_retriever is not None
     response_generator = tutor.run_agent_async(
         query=request.query,
         history=request.history,
         is_knowledge_base_ready=is_kb_ready
     )
-    
-    return StreamingResponse(response_generator, media_type="text/plain")
 
+    async def event_stream():
+        import json
+        async def send(obj: dict):
+            yield f"data: {json.dumps(obj)}\n\n"
+        try:
+            async for chunk in response_generator:
+                if not chunk:
+                    continue
+                async for part in send({"type": "text_chunk", "content": chunk}):
+                    yield part
+            async for part in send({"type": "done"}):
+                yield part
+        except Exception as e:
+            logger.error(f"Error in chatbot stream: {e}", exc_info=True)
+            async for part in send({"type": "error", "message": str(e)}):
+                yield part
 
-# ==============================================================================
-# 2. ASSESSMENT ENDPOINT
-# ==============================================================================
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "text/event-stream",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(event_stream(), headers=headers, media_type="text/event-stream")
+
+# ==============================
+# 4. ASSESSMENT ENDPOINT
+# ==============================
 
 class AssessmentSchema(BaseModel):
     test_title: str = Field(..., description="The title of the test.", example="The American Revolution")
@@ -228,6 +542,7 @@ class AssessmentSchema(BaseModel):
     learning_objectives: Optional[str] = Field("", description="Learning objectives for the assessment.")
     anxiety_triggers: Optional[str] = Field("", description="Anxiety considerations to account for.")
     user_prompt: Optional[str] = Field("None.", description="Optional specific instructions for the AI.", example="Focus on the strategic importance of each battle.")
+    language: Optional[str] = Field("English", description="The language to generate the assessment in (e.g., English, Arabic)")
 
 @app.post("/assessment_endpoint", response_model=Dict[str, Any])
 async def assessment_endpoint(schema: AssessmentSchema):
@@ -236,10 +551,6 @@ async def assessment_endpoint(schema: AssessmentSchema):
     The response will contain the formatted questions and a separate answer key.
     Supports both single question type and mixed question type assessments.
     """
-    if not assessment_chain:
-        logger.error("Assessment endpoint called, but chain is not initialized (likely missing or invalid GOOGLE_API_KEY).")
-        raise HTTPException(status_code=500, detail="Assessment generation is not configured on the server.")
-    
     try:
         # Convert the schema to dict for processing
         schema_dict = schema.model_dump()
@@ -269,10 +580,9 @@ async def assessment_endpoint(schema: AssessmentSchema):
         logger.error(f"Error in assessment generation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ==============================================================================
-# 3. TEACHING CONTENT ENDPOINT
-# ==============================================================================
+# ==============================
+# 5. TEACHING CONTENT ENDPOINT
+# ==============================
 
 class TeachingContentSchema(BaseModel):
     content_type: str = Field(
@@ -308,7 +618,12 @@ class TeachingContentSchema(BaseModel):
     # New: Forward additional AI options used by the generator module
     additional_ai_options: Optional[List[str]] = Field(
         default=None,
-        description="List of AI options: 'adaptive difficulty', 'include assessment', 'multimedia suggestion'"
+        description="List of AI options: 'adaptive difficulty', 'include assessment', 'multimedia suggestion', 'generate slides'"
+    )
+    # Add language parameter
+    language: str = Field(
+        "English",
+        description="The language for the content (e.g., English, Arabic)."
     )
 
 @app.post("/teaching_content_endpoint", response_model=Dict[str, Any])
@@ -337,9 +652,9 @@ async def teaching_content_endpoint(schema: TeachingContentSchema):
         logger.error(f"Error in teaching content endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
 
-# ==============================================================================
-# 4. PRESENTATION ENDPOINT
-# ==============================================================================
+# ==============================
+# 6. PRESENTATION ENDPOINT
+# ==============================
 
 class PresentationSchema(BaseModel):
     plain_text: str = Field(..., description="The main topic or content of the presentation.", example="Introduction to Machine Learning")
@@ -355,10 +670,6 @@ async def presentation_endpoint(schema: PresentationSchema):
     Generates a SlideSpeak presentation based on the provided specifications.
     Returns the complete task result including the presentation URL.
     """
-    if not slidespeak_api_key:
-        logger.error("Presentation endpoint called, but SLIDESPEAK_API_KEY is not configured.")
-        raise HTTPException(status_code=500, detail="Presentation generation is not configured on the server.")
-    
     try:
         # Instantiate the generator. It will automatically use the API key from the environment.
         try:
@@ -406,7 +717,7 @@ async def presentation_endpoint(schema: PresentationSchema):
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
 
 # ==============================
-# 5. IMAGE GENERATION ENDPOINT
+# 7. IMAGE GENERATION ENDPOINT
 # ==============================
 class ImageGenSchema(BaseModel):
     topic: str = Field(..., description="Topic for the image")
@@ -415,16 +726,18 @@ class ImageGenSchema(BaseModel):
     subject: str = Field(..., description="Subject")
     instructions: str = Field(..., description="Detailed instructions")
     difficulty_flag: str = Field("false", description="true/false flag")
+    language: str = Field("English", description="Language for labels (e.g., English, Arabic)")
 
 @app.post("/image_generation_endpoint", response_model=Dict[str, Any])
 async def image_generation_endpoint(schema: ImageGenSchema):
     try:
         generator = ImageGenerator()
         schema_dict = schema.model_dump()
-        image_url = generator.generate_image_from_schema(schema_dict)
-        if not image_url:
+        image_b64 = generator.generate_image_from_schema(schema_dict)
+        if not image_b64:
             raise HTTPException(status_code=500, detail="Image generation failed.")
-        return {"image_url": image_url}
+        data_url = f"data:image/png;base64,{image_b64}"
+        return {"image_url": data_url}
     except HTTPException:
         raise
     except Exception as e:
@@ -432,7 +745,7 @@ async def image_generation_endpoint(schema: ImageGenSchema):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==============================
-# 6. WEB SEARCH ENDPOINT
+# 8. WEB SEARCH ENDPOINT
 # ==============================
 class WebSearchSchema(BaseModel):
     topic: str = Field(..., description="Search topic")
@@ -454,7 +767,7 @@ async def web_search_endpoint(schema: WebSearchSchema):
             f"Show me up to {data['max_results']} {data['content_type']} about '{data['topic']}' "
             f"for a grade {data['grade_level']} {data['subject']} class. "
             f"The content should be in {data['language']} with a {data['comprehension']} comprehension level. "
-            "Include links in the response with detailed lengthy response content."
+            "Include links in the response with detailed lengthy response content. "
             "Include the source of the content in the response."
         )
         full_response = ""
@@ -475,12 +788,13 @@ async def web_search_endpoint(schema: WebSearchSchema):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==============================
-# 7. COMICS STREAMING ENDPOINT
+# 9. COMICS STREAMING ENDPOINT
 # ==============================
 class ComicsSchema(BaseModel):
     instructions: str = Field(..., description="Educational story/topic, e.g., Water cycle")
     grade_level: str = Field(..., description="Grade level string, e.g., '5' or 'Grade 5'")
     num_panels: int = Field(..., description="Number of panels to generate", ge=1, le=20)
+    language: str = Field("English", description="Language for comic text (e.g., English, Arabic)")
 
 def _parse_panel_prompts(story_text: str):
     lines = story_text.strip().split("\n")
@@ -509,7 +823,8 @@ async def comics_stream_endpoint(schema: ComicsSchema):
                 create_comical_story_prompt,
                 schema.instructions,
                 schema.grade_level,
-                schema.num_panels
+                schema.num_panels,
+                schema.language  # Pass language parameter
             )
             if not story_prompts:
                 async for chunk in send({"type": "error", "message": "Failed to generate story prompts."}):
@@ -558,6 +873,41 @@ async def comics_stream_endpoint(schema: ComicsSchema):
         "X-Accel-Buffering": "no",  # for some proxies
     }
     return StreamingResponse(event_stream(), headers=headers, media_type="text/event-stream")
+
+# Add this new endpoint for TTS generation
+class VoiceResponseSchema(BaseModel):
+    """Schema for voice response (TTS) requests."""
+    text: str = Field(..., description="Text to convert to speech")
+    voice: str = Field("alloy", description="Voice to use for TTS")
+
+@app.post("/voice_response_endpoint")
+async def voice_response_endpoint(schema: VoiceResponseSchema):
+    """Generate speech from text using OpenAI's TTS API."""
+    try:
+        logger.info(f"Generating speech for text: '{schema.text[:100]}...'")
+        
+        # Import the TTS function
+        from AI_voice_functionality import text_to_speech
+        
+        # Generate speech
+        audio_data = await run_in_threadpool(text_to_speech, schema.text)
+        
+        if audio_data:
+            # Convert to hex string for JSON response
+            audio_hex = audio_data.hex()
+            return {
+                "success": True,
+                "audio_data": audio_hex,
+                "message": "Speech generated successfully"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to generate speech")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in voice response endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- Uvicorn Server Runner ---
 if __name__ == "__main__":
